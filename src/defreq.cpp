@@ -4,13 +4,13 @@
     Original DeFreq Copyright (C) 2004-2006 A.G.Balakhnin aka Fizick
     http://avisynth.org.ru
 
-    DeFreq+ modernization (2026):
+    DeFreq+ port (2026):
       - 64-bit build support
       - High bit depth planar YUV (8-16 bit, 420/422/444)
       - AviSynth+ C++ API (AvisynthPluginInit3)
       - Removed legacy YUY2 code path
       - Dynamic FFTW3 loading with multiple DLL name fallbacks
-      - Robust bounds checking on all array accesses
+      - Faithful line-by-line port of original Fizick algorithms
 
     This program is free software; you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -46,11 +46,11 @@ class DeFreq : public GenericVideoFilter {
     bool  info;
     bool  measure;
 
-    float          *fft_in;
-    fftwf_complex  *fft_out;
-    fftwf_plan      plan_fwd, plan_inv;
+    float          *in;
+    fftwf_complex  *out;
+    fftwf_plan      plan, plani;
 
-    int             nx, ny;      // = actual image plane dimensions (no padding)
+    int             nx, ny;      // = actual image plane dimensions
     int             outwidth;    // nx/2 + 1
     float          *psd;
     int             naverage;
@@ -68,16 +68,12 @@ class DeFreq : public GenericVideoFilter {
     fftwf_execute_dft_r2c_proc   fftwf_execute_dft_r2c;
     fftwf_execute_dft_c2r_proc   fftwf_execute_dft_c2r;
 
-    void ProcessPlanar(uint8_t *srcp, int height, int width, int pitch,
-        float *fxPeak, float *fyPeak, float *sharpPeak,
-        float *fxPeak2, float *fyPeak2, float *sharpPeak2,
-        float *fxPeak3, float *fyPeak3, float *sharpPeak3,
-        float *fxPeak4, float *fyPeak4, float *sharpPeak4);
+    // Faithful ports of original Fizick helper functions
+    void SearchBoxBackground(float *psd, int outwidth, int height,
+        float fx, float fy, float dx, float dy, float &background);
     void SearchPeak(float *psd, int outwidth, int height,
         float fx, float fy, float dx, float dy,
         float *fxPeak, float *fyPeak, float *sharpPeak);
-    void SearchBoxBackground(float *psd, int outwidth, int height,
-        float fx, float fy, float dx, float dy, float &background);
     void CleanWindow(fftwf_complex *out, int outwidth, int height,
         float fx, float fy, float dx, float dy,
         float fxPeak, float fyPeak, float sharpPeak);
@@ -88,11 +84,19 @@ class DeFreq : public GenericVideoFilter {
     void FrequencySwitchOn(fftwf_complex *outp, int outwidth, int height,
         float fx, float fy, float setvalue);
 
+    // Main processing function
+    void DeFreqProcess(uint8_t *srcp0, int src_height, int src_width, int src_pitch,
+        float *fxPeak, float *fyPeak, float *sharpPeak,
+        float *fxPeak2, float *fyPeak2, float *sharpPeak2,
+        float *fxPeak3, float *fyPeak3, float *sharpPeak3,
+        float *fxPeak4, float *fyPeak4, float *sharpPeak4);
+
+    // Bit-depth helpers
     inline float ReadPixel(const uint8_t *ptr, int x) const {
         if (bits_per_sample == 8) return static_cast<float>(ptr[x]);
         else return static_cast<float>(reinterpret_cast<const uint16_t*>(ptr)[x]);
     }
-    inline void WritePixelInt(uint8_t *ptr, int x, int ival) const {
+    inline void WritePixelClamped(uint8_t *ptr, int x, int ival) const {
         ival = max(0, min(max_pixel_value, ival));
         if (bits_per_sample == 8) ptr[x] = static_cast<uint8_t>(ival);
         else reinterpret_cast<uint16_t*>(ptr)[x] = static_cast<uint16_t>(ival);
@@ -119,16 +123,17 @@ static void mem_set_plane(uint8_t *dest, int value16, int height, int row_bytes,
         for (int h = 0; h < height; h++) { memset(dest, v8, row_bytes); dest += pitch; }
     } else {
         uint16_t v16 = static_cast<uint16_t>(value16);
-        int width_pixels = row_bytes / 2;
+        int wp = row_bytes / 2;
         for (int h = 0; h < height; h++) {
             uint16_t *d = reinterpret_cast<uint16_t*>(dest);
-            for (int w = 0; w < width_pixels; w++) d[w] = v16;
+            for (int w = 0; w < wp; w++) d[w] = v16;
             dest += pitch;
         }
     }
 }
 
 // ---------------------------------------------------------------------------
+// Constructor
 DeFreq::DeFreq(PClip _child,
     float _fx, float _fy, float _dx, float _dy, float _sharp,
     float _fx2, float _fy2, float _dx2, float _dy2, float _sharp2,
@@ -142,8 +147,8 @@ DeFreq::DeFreq(PClip _child,
       fx3(_fx3), fy3(_fy3), dx3(_dx3), dy3(_dy3), sharp3(_sharp3),
       fx4(_fx4), fy4(_fy4), dx4(_dx4), dy4(_dy4), sharp4(_sharp4),
       cutx(_cutx), cuty(_cuty), plane(_plane), show(_show), info(_info), measure(_measure),
-      fft_in(nullptr), fft_out(nullptr), psd(nullptr), hinstLib(nullptr),
-      plan_fwd(nullptr), plan_inv(nullptr)
+      in(nullptr), out(nullptr), psd(nullptr), hinstLib(nullptr),
+      plan(nullptr), plani(nullptr)
 {
     if (fx < 0 || fx > 100 || fx2 < 0 || fx2 > 100 || fx3 < 0 || fx3 > 100 || fx4 < 0 || fx4 > 100)
         env->ThrowError("DeFreq: fx,fx2,fx3,fx4 must be from 0.0 to 100.0%%");
@@ -168,7 +173,7 @@ DeFreq::DeFreq(PClip _child,
     max_pixel_value = (1 << bits_per_sample) - 1;
     neutral_value   = static_cast<float>(1 << (bits_per_sample - 1));
 
-    // Use exact image dimensions — no padding
+    // Exact image dimensions — same as original Fizick code
     if (plane == 0) {
         nx = vi.width;
         ny = vi.height;
@@ -182,11 +187,11 @@ DeFreq::DeFreq(PClip _child,
         "libfftw3f-3.dll", "fftw3f.dll", "fftw3.dll", "libfftw3-3.dll", nullptr
     };
     hinstLib = nullptr;
-    for (int i = 0; dll_names[i] != nullptr; i++) {
+    for (int i = 0; dll_names[i]; i++) {
         hinstLib = LoadLibraryA(dll_names[i]);
-        if (hinstLib != nullptr) break;
+        if (hinstLib) break;
     }
-    if (hinstLib != nullptr) {
+    if (hinstLib) {
         fftwf_malloc           = (fftwf_malloc_proc)          GetProcAddress(hinstLib, "fftwf_malloc");
         fftwf_free             = (fftwf_free_proc)            GetProcAddress(hinstLib, "fftwf_free");
         fftwf_plan_dft_r2c_2d  = (fftwf_plan_dft_r2c_2d_proc)GetProcAddress(hinstLib, "fftwf_plan_dft_r2c_2d");
@@ -195,338 +200,393 @@ DeFreq::DeFreq(PClip _child,
         fftwf_execute_dft_r2c  = (fftwf_execute_dft_r2c_proc) GetProcAddress(hinstLib, "fftwf_execute_dft_r2c");
         fftwf_execute_dft_c2r  = (fftwf_execute_dft_c2r_proc) GetProcAddress(hinstLib, "fftwf_execute_dft_c2r");
     }
-    if (hinstLib == nullptr || fftwf_malloc == nullptr || fftwf_free == nullptr ||
-        fftwf_plan_dft_r2c_2d == nullptr || fftwf_plan_dft_c2r_2d == nullptr ||
-        fftwf_destroy_plan == nullptr || fftwf_execute_dft_r2c == nullptr ||
-        fftwf_execute_dft_c2r == nullptr) {
+    if (!hinstLib || !fftwf_malloc || !fftwf_free || !fftwf_plan_dft_r2c_2d ||
+        !fftwf_plan_dft_c2r_2d || !fftwf_destroy_plan || !fftwf_execute_dft_r2c || !fftwf_execute_dft_c2r) {
         if (hinstLib) FreeLibrary(hinstLib);
         env->ThrowError("DeFreq: cannot load FFTW3 DLL!");
     }
 
-    fft_in  = (float *)fftwf_malloc(sizeof(float) * nx * ny);
+    in  = (float *)fftwf_malloc(sizeof(float) * nx * ny);
     outwidth = nx / 2 + 1;
-    fft_out = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * ny * outwidth);
-    psd     = (float *)calloc(ny * outwidth, sizeof(float));
-    if (!fft_in || !fft_out || !psd)
+    out = (fftwf_complex *)fftwf_malloc(sizeof(fftwf_complex) * ny * outwidth);
+    psd = (float *)malloc(sizeof(float) * ny * outwidth);
+    if (!in || !out || !psd)
         env->ThrowError("DeFreq: memory allocation failed");
 
-    // Always use FFTW_ESTIMATE — safe for all dimensions, no trial FFTs
-    plan_fwd = fftwf_plan_dft_r2c_2d(ny, nx, fft_in, fft_out, FFTW_ESTIMATE);
-    plan_inv = fftwf_plan_dft_c2r_2d(ny, nx, fft_out, fft_in, FFTW_ESTIMATE);
-    if (!plan_fwd || !plan_inv)
+    // Always use FFTW_ESTIMATE for safety with arbitrary dimensions
+    plan  = fftwf_plan_dft_r2c_2d(ny, nx, in, out, FFTW_ESTIMATE);
+    plani = fftwf_plan_dft_c2r_2d(ny, nx, out, in, FFTW_ESTIMATE);
+    if (!plan || !plani)
         env->ThrowError("DeFreq: FFTW plan creation failed (%dx%d)", nx, ny);
 
+    // Init PSD to zero — matching original
     naverage = 0;
+    for (int y = 0; y < ny; y++) {
+        for (int x = 0; x < outwidth; x++) {
+            psd[y * outwidth + x] = 0;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 DeFreq::~DeFreq() {
-    if (plan_fwd)   fftwf_destroy_plan(plan_fwd);
-    if (plan_inv)   fftwf_destroy_plan(plan_inv);
-    if (fft_in)     fftwf_free(fft_in);
-    if (fft_out)    fftwf_free(fft_out);
-    if (psd)        free(psd);
-    if (hinstLib)   FreeLibrary(hinstLib);
+    if (plan)     fftwf_destroy_plan(plan);
+    if (plani)    fftwf_destroy_plan(plani);
+    if (in)       fftwf_free(in);
+    if (out)      fftwf_free(out);
+    if (psd)      free(psd);
+    if (hinstLib) FreeLibrary(hinstLib);
 }
 
 // ---------------------------------------------------------------------------
-void DeFreq::SearchBoxBackground(float *psd_ptr, int ow, int ht,
-    float fx_, float fy_, float dx_, float dy_, float &background)
+// FAITHFUL PORT of original Fizick SearchBoxBackground (v0.7)
+void DeFreq::SearchBoxBackground(float *psd, int outwidth, int height,
+    float fx, float fy, float dx, float dy, float &background)
 {
-    float fxmin = max(0.0f, fx_ - dx_);
-    float fxmax = min(100.0f, fx_ + dx_);
-    float fymin = max(-100.0f, fy_ - dy_);
-    float fymax = min(100.0f, fy_ + dy_);
-    int ixmin = max(0, (int)(fxmin * ow / 100.0f));
-    int ixmax = min((int)(fxmax * ow / 100.0f), ow - 1);
-    int iymin = (int)(fymin * ht / 200.0f);
-    int iymax = (int)(fymax * ht / 200.0f);
+    float fxmin = max(0.0f, fx - dx);
+    float fxmax = min(100.0f, fx + dx);
+    float fymin = max(-100.0f, fy - dy);
+    float fymax = min(100.0f, fy + dy);
 
-    int hmin_idx = (iymin >= 0) ? iymin : iymin + ht;
-    int hmax_idx = (iymax >= 0) ? iymax : iymax + ht;
-    hmin_idx = max(0, min(hmin_idx, ht - 1));
-    hmax_idx = max(0, min(hmax_idx, ht - 1));
-    ixmin = max(0, min(ixmin, ow - 1));
-    ixmax = max(0, min(ixmax, ow - 1));
+    int ixmin = int(fxmin * outwidth) / 100;
+    int ixmax = int(fxmax * outwidth) / 100;
+    int iymin = int(fymin * height) / 200;
+    int iymax = int(fymax * height) / 200;
 
-    int counter = 0; float sum = 0;
-    if (hmin_idx <= hmax_idx) {
-        float *p = psd_ptr + ow * hmin_idx;
-        // top edge
-        for (int w = ixmin; w <= ixmax; w++) { sum += sqrtf(p[w]); counter++; }
-        // sides
-        for (int hh = hmin_idx; hh < hmax_idx; hh++) {
-            sum += sqrtf(p[ixmin]); sum += sqrtf(p[ixmax]); counter += 2; p += ow;
+    int hmin = (iymin >= 0) ? iymin : iymin + height - 1;
+    int hmax = (iymax >= 0) ? iymax : iymax + height - 1;
+    int w, h;
+    int counter = 0;
+    float sum = 0;
+    if (hmin <= hmax) {
+        float *p = psd + outwidth * hmin;
+        for (w = ixmin; w <= ixmax; w++) sum += sqrtf(p[w]);
+        for (h = hmin; h < hmax; h++) {
+            sum += sqrtf(p[ixmin]);
+            sum += sqrtf(p[ixmax]);
+            p += outwidth;
         }
-        // bottom edge
-        for (int w = ixmin; w <= ixmax; w++) { sum += sqrtf(p[w]); counter++; }
+        for (w = ixmin; w <= ixmax; w++) sum += sqrtf(p[w]);
+        counter += (ixmax - ixmin + 1) * 2 + (hmax - hmin + 1) * 2;
     } else {
-        // wrapping case: hmin > hmax (fy range crosses zero)
-        float *p = psd_ptr;
-        for (int hh = 0; hh <= hmax_idx; hh++) {
-            sum += sqrtf(p[ixmin]); sum += sqrtf(p[ixmax]); counter += 2; p += ow;
+        float *p = psd;
+        for (h = 0; h < hmax; h++) {
+            sum += sqrtf(p[ixmin]);
+            sum += sqrtf(p[ixmax]);
+            p += outwidth;
         }
-        p = psd_ptr + ow * hmin_idx;
-        for (int hh = hmin_idx; hh < ht; hh++) {
-            sum += sqrtf(p[ixmin]); sum += sqrtf(p[ixmax]); counter += 2; p += ow;
+        for (w = ixmin; w < ixmax; w++) sum += sqrtf(p[w]);
+        p += outwidth * (hmin - hmax);
+        for (w = ixmin; w < ixmax; w++) sum += sqrtf(p[w]);
+        for (h = hmin; h < height; h++) {
+            sum += sqrtf(p[ixmin]);
+            sum += sqrtf(p[ixmax]);
+            p += outwidth;
         }
+        counter += hmax * 2 + (ixmax - ixmin) + (height - hmin) * 2;
     }
-    background = (counter > 0) ? sum * sum / ((float)counter * counter) : 0;
+    background = sum * sum / ((float)counter * counter + 0.0001f);
 }
 
 // ---------------------------------------------------------------------------
-void DeFreq::SearchPeak(float *psd_ptr, int ow, int ht,
-    float fx_, float fy_, float dx_, float dy_,
+// FAITHFUL PORT of original Fizick SearchPeak
+void DeFreq::SearchPeak(float *psd, int outwidth, int height,
+    float fx, float fy, float dx, float dy,
     float *fxPeak, float *fyPeak, float *sharpPeak)
 {
-    float fxmin = max(0.0f, fx_ - dx_);
-    float fxmax = min(100.0f, fx_ + dx_);
-    float fymin = max(-100.0f, fy_ - dy_);
-    float fymax = min(100.0f, fy_ + dy_);
-    int ixmin = max(0, (int)(fxmin * ow / 100.0f));
-    int ixmax = min((int)(fxmax * ow / 100.0f), ow - 1);
-    int iymin = (int)(fymin * ht / 200.0f);
-    int iymax = (int)(fymax * ht / 200.0f);
+    float fxmin = max(0.0f, fx - dx);
+    float fxmax = min(100.0f, fx + dx);
+    float fymin = max(-100.0f, fy - dy);
+    float fymax = min(100.0f, fy + dy);
 
-    float fftmax = -1.0f; int hmax_pos = 0, wmax_pos = 0;
+    int ixmin = int(fxmin * outwidth) / 100;
+    int ixmax = int(fxmax * outwidth) / 100;
+    int iymin = int(fymin * height) / 200;
+    int iymax = int(fymax * height) / 200;
+
+    float fftmax = -1;
+    int hmax = 0, wmax = 0;
+    int h, w;
+
     float fftbackground;
-    SearchBoxBackground(psd_ptr, ow, ht, fx_, fy_, dx_, dy_, fftbackground);
+    SearchBoxBackground(psd, outwidth, height, fx, fy, dx, dy, fftbackground);
 
-    float *p = psd_ptr;
-    // top half (positive frequencies)
-    for (int h = 0; h < ht / 2; h++) {
+    float *p = psd;
+    for (h = 0; h < height / 2; h++) {
         if (h >= iymin && h <= iymax) {
-            for (int w = ixmin; w <= ixmax; w++) {
-                if (p[w] > fftmax) { fftmax = p[w]; hmax_pos = h; wmax_pos = w; }
+            for (w = ixmin; w <= ixmax; w++) {
+                float fftcur = p[w];
+                if (fftcur > fftmax) { fftmax = fftcur; hmax = h; wmax = w; }
             }
         }
-        p += ow;
+        p += outwidth;
     }
-    // bottom half (negative frequencies)
-    for (int h = ht / 2; h < ht; h++) {
-        if (h >= ht + iymin - 1 && h <= ht + iymax - 1) {
-            for (int w = ixmin; w <= ixmax; w++) {
-                if (p[w] > fftmax) { fftmax = p[w]; hmax_pos = h; wmax_pos = w; }
+    for (h = height / 2; h < height; h++) {
+        if (h >= height + iymin - 1 && h <= height + iymax - 1) {
+            for (w = ixmin; w <= ixmax; w++) {
+                float fftcur = p[w];
+                if (fftcur > fftmax) { fftmax = fftcur; hmax = h; wmax = w; }
             }
         }
-        p += ow;
+        p += outwidth;
     }
 
-    *fxPeak = (wmax_pos * 100.0f) / ow;
-    *fyPeak = (hmax_pos < ht / 2) ? (hmax_pos * 200.0f) / ht
-                                    : ((hmax_pos - ht + 1) * 200.0f) / ht;
-    *sharpPeak = (fftbackground > 0) ? fftmax / fftbackground : 1;
+    *fxPeak = (wmax * 100.0f) / outwidth;
+    *fyPeak = (hmax < height / 2) ? (hmax * 200.0f) / height : (hmax - height + 1) * 200.0f / height;
+
+    if (fftbackground > 0)
+        *sharpPeak = fftmax / fftbackground;
+    else
+        *sharpPeak = 1;
 }
 
 // ---------------------------------------------------------------------------
-void DeFreq::CleanWindow(fftwf_complex *out_ptr, int ow, int ht,
-    float fx_, float fy_, float dx_, float dy_,
+// FAITHFUL PORT of original Fizick CleanWindow (v0.7)
+void DeFreq::CleanWindow(fftwf_complex *out, int outwidth, int height,
+    float fx, float fy, float dx, float dy,
     float fxPeak, float fyPeak, float sharpPeak)
 {
-    int w_Peak = min((int)(fxPeak * ow / 100.0f), ow - 1);
-    int h_Peak = (fyPeak > 0) ? (int)(fyPeak * ht / 200.0f) : (int)(fyPeak * ht / 200.0f) + ht - 1;
-    h_Peak = max(0, min(h_Peak, ht - 1));
+    fftwf_complex *outp = out;
 
-    fftwf_complex *pp = out_ptr + ow * h_Peak;
-    float fftmax_val = pp[w_Peak][0] * pp[w_Peak][0] + pp[w_Peak][1] * pp[w_Peak][1];
-    float fftbg = (sharpPeak > 0) ? fftmax_val / sharpPeak : 0;
+    int w_Peak = int(fxPeak * outwidth) / 100;
+    int h_Peak = (fyPeak > 0) ? int(fyPeak * height) / 200 : int(fyPeak * height) / 200 + height - 1;
+    outp += outwidth * h_Peak;
+    float fftmax = (outp[w_Peak][0]) * (outp[w_Peak][0]) + (outp[w_Peak][1]) * (outp[w_Peak][1]);
+    float fftbackground = fftmax / sharpPeak;
 
-    float fxmin = max(0.0f, fx_ - dx_);  float fxmax = min(100.0f, fx_ + dx_);
-    float fymin = max(-100.0f, fy_ - dy_); float fymax = min(100.0f, fy_ + dy_);
-    int ixmin = max(0, (int)(fxmin * ow / 100.0f));
-    int ixmax = min((int)(fxmax * ow / 100.0f), ow - 1);
-    int iymin = (int)(fymin * ht / 200.0f);
-    int iymax = (int)(fymax * ht / 200.0f);
+    outp = out;
 
-    fftwf_complex *p = out_ptr;
-    for (int h = 0; h < ht / 2; h++) {
+    float fxmin = max(0.0f, fx - dx);
+    float fxmax = min(100.0f, fx + dx);
+    float fymin = max(-100.0f, fy - dy);
+    float fymax = min(100.0f, fy + dy);
+
+    int ixmin = int(fxmin * outwidth) / 100;
+    int ixmax = int(fxmax * outwidth) / 100;
+    int iymin = int(fymin * height) / 200;
+    int iymax = int(fymax * height) / 200;
+
+    int h, w;
+    for (h = 0; h < height / 2; h++) {
         if (h >= iymin && h <= iymax) {
-            for (int w = ixmin; w <= ixmax; w++) {
-                float fftcur = p[w][0] * p[w][0] + p[w][1] * p[w][1];
-                if (fftcur > fftbg) {
-                    float f = sqrtf(fftbg / fftcur);
-                    p[w][0] *= f; p[w][1] *= f;
+            for (w = ixmin; w <= ixmax; w++) {
+                float fftcur = (outp[w][0]) * (outp[w][0]) + (outp[w][1]) * (outp[w][1]);
+                if (fftcur > fftbackground) {
+                    float f = sqrtf(fftbackground / fftcur);
+                    outp[w][0] *= f;
+                    outp[w][1] *= f;
                 }
             }
         }
-        p += ow;
+        outp += outwidth;
     }
-    for (int h = ht / 2; h < ht; h++) {
-        if (h >= ht + iymin - 1 && h <= ht + iymax - 1) {
-            for (int w = ixmin; w <= ixmax; w++) {
-                float fftcur = p[w][0] * p[w][0] + p[w][1] * p[w][1];
-                if (fftcur > fftbg) {
-                    float f = sqrtf(fftbg / fftcur);
-                    p[w][0] *= f; p[w][1] *= f;
+    for (h = height / 2; h < height; h++) {
+        if (h >= height + iymin - 1 && h <= height + iymax - 1) {
+            for (w = ixmin; w <= ixmax; w++) {
+                float fftcur = (outp[w][0]) * (outp[w][0]) + (outp[w][1]) * (outp[w][1]);
+                if (fftcur > fftbackground) {
+                    float f = sqrtf(fftbackground / fftcur);
+                    outp[w][0] *= f;
+                    outp[w][1] *= f;
                 }
             }
         }
-        p += ow;
+        outp += outwidth;
     }
 }
 
 // ---------------------------------------------------------------------------
-void DeFreq::CleanHigh(fftwf_complex *outp, int ow, int ht, float cutx_, float cuty_)
+// FAITHFUL PORT of original Fizick CleanHigh
+void DeFreq::CleanHigh(fftwf_complex *outp, int outwidth, int height, float cutx, float cuty)
 {
-    float invcutx = 100.0f / (cutx_ * ow);
-    float invcuty = 200.0f / (cuty_ * ht);
-    fftwf_complex *p = outp;
-    for (int h = 0; h < ht / 2; h++) {
-        float fh = (float)h * invcuty; fh *= fh;
-        for (int w = 0; w < ow; w++) {
-            float fw = (float)w * invcutx; fw *= fw;
-            float f = 1.0f / (1.0f + fh + fw);
-            p[w][0] *= f; p[w][1] *= f;
+    int w, h;
+    float fh, fw, f;
+    float invcutx = 100.0f / (cutx * outwidth);
+    float invcuty = 200.0f / (cuty * height);
+    for (h = 0; h < height / 2; h++) {
+        fh = float(h) * invcuty; fh *= fh;
+        for (w = 0; w < outwidth; w++) {
+            fw = float(w) * invcutx; fw *= fw;
+            f = 1 / (1 + fh + fw);
+            outp[w][0] *= f; outp[w][1] *= f;
         }
-        p += ow;
+        outp += outwidth;
     }
-    for (int h = ht / 2; h < ht; h++) {
-        float fh = (float)(ht - h - 1) * invcuty; fh *= fh;
-        for (int w = 0; w < ow; w++) {
-            float fw = (float)w * invcutx; fw *= fw;
-            float f = 1.0f / (1.0f + fh + fw);
-            p[w][0] *= f; p[w][1] *= f;
+    for (h = height / 2; h < height; h++) {
+        fh = float(height - h - 1) * invcuty; fh *= fh;
+        for (w = 0; w < outwidth; w++) {
+            fw = float(w) * invcutx; fw *= fw;
+            f = 1 / (1 + fh + fw);
+            outp[w][0] *= f; outp[w][1] *= f;
         }
-        p += ow;
+        outp += outwidth;
     }
 }
 
 // ---------------------------------------------------------------------------
-void DeFreq::GetFFT2minmax(float *psd_ptr, int ow, int ht, float *fft2min, float *fft2max)
+void DeFreq::GetFFT2minmax(float *psd, int outwidth, int height, float *fft2min, float *fft2max)
 {
-    float psdmax = 0; float *p = psd_ptr;
-    for (int h = 0; h < ht; h++) {
-        for (int w = 0; w < ow; w++) { if (p[w] > psdmax) psdmax = p[w]; }
-        p += ow;
+    float psdmin = 1.0e14f;
+    float psdmax = 0;
+    for (int h = 0; h < height; h++) {
+        for (int w = 0; w < outwidth; w++) {
+            float fft2cur = psd[w];
+            if (fft2cur > psdmax) psdmax = fft2cur;
+        }
+        psd += outwidth;
     }
     if (psdmax == 0) psdmax = 1.0f;
-    *fft2min = psdmax * 1.0e-13f;
+    psdmin = psdmax * 1.0e-13f;
+    *fft2min = psdmin;
     *fft2max = psdmax;
 }
 
 // ---------------------------------------------------------------------------
-void DeFreq::DrawSearchBox(float *psd_ptr, int ow, int ht,
-    float fx_, float fy_, float dx_, float dy_, float fftval)
+// FAITHFUL PORT of original Fizick DrawSearchBox
+void DeFreq::DrawSearchBox(float *psd, int outwidth, int height,
+    float fx, float fy, float dx, float dy, float fftvalue)
 {
-    float fxmin = max(0.0f, fx_ - dx_); float fxmax = min(100.0f, fx_ + dx_);
-    float fymin = max(-100.0f, fy_ - dy_); float fymax = min(100.0f, fy_ + dy_);
-    int ixmin = max(0, (int)(fxmin * ow / 100.0f));
-    int ixmax = min((int)(fxmax * ow / 100.0f), ow - 1);
-    int hmin_idx = (int)(fymin * ht / 200.0f);
-    int hmax_idx = (int)(fymax * ht / 200.0f);
-    hmin_idx = (hmin_idx >= 0) ? hmin_idx : hmin_idx + ht;
-    hmax_idx = (hmax_idx >= 0) ? hmax_idx : hmax_idx + ht;
-    hmin_idx = max(0, min(hmin_idx, ht - 1));
-    hmax_idx = max(0, min(hmax_idx, ht - 1));
+    float fxmin = max(0.0f, fx - dx);
+    float fxmax = min(100.0f, fx + dx);
+    float fymin = max(-100.0f, fy - dy);
+    float fymax = min(100.0f, fy + dy);
 
-    if (hmin_idx <= hmax_idx) {
-        float *p = psd_ptr + ow * hmin_idx;
-        for (int w = ixmin; w <= ixmax; w++) p[w] = fftval;
-        for (int h = hmin_idx; h < hmax_idx; h++) { p[ixmin] = fftval; p[ixmax] = fftval; p += ow; }
-        for (int w = ixmin; w <= ixmax; w++) p[w] = fftval;
+    int ixmin = int(fxmin * outwidth) / 100;
+    int ixmax = int(fxmax * outwidth) / 100;
+    int iymin = int(fymin * height) / 200;
+    int iymax = int(fymax * height) / 200;
+
+    int hmin = (iymin >= 0) ? iymin : iymin + height - 1;
+    int hmax = (iymax >= 0) ? iymax : iymax + height - 1;
+    int w, h;
+    if (hmin <= hmax) {
+        float *p = psd + outwidth * hmin;
+        for (w = ixmin; w <= ixmax; w++) p[w] = fftvalue;
+        for (h = hmin; h < hmax; h++) {
+            p[ixmin] = fftvalue; p[ixmax] = fftvalue; p += outwidth;
+        }
+        for (w = ixmin; w <= ixmax; w++) p[w] = fftvalue;
     } else {
-        float *p = psd_ptr;
-        for (int h = 0; h <= hmax_idx; h++) { p[ixmin] = fftval; p[ixmax] = fftval; p += ow; }
-        p = psd_ptr + ow * hmin_idx;
-        for (int h = hmin_idx; h < ht; h++) { p[ixmin] = fftval; p[ixmax] = fftval; p += ow; }
+        float *p = psd;
+        for (h = 0; h < hmax; h++) { p[ixmin] = fftvalue; p[ixmax] = fftvalue; p += outwidth; }
+        for (w = ixmin; w < ixmax; w++) p[w] = fftvalue;
+        p += outwidth * (hmin - hmax);
+        for (w = ixmin; w < ixmax; w++) p[w] = fftvalue;
+        for (h = hmin; h < height; h++) { p[ixmin] = fftvalue; p[ixmax] = fftvalue; p += outwidth; }
     }
 }
 
 // ---------------------------------------------------------------------------
-void DeFreq::FrequencySwitchOn(fftwf_complex *outp, int ow, int ht,
-    float fx_, float fy_, float setvalue)
+void DeFreq::FrequencySwitchOn(fftwf_complex *outp, int outwidth, int height,
+    float fx, float fy, float setvalue)
 {
-    int ix = min((int)(fx_ * ow / 100.0f), ow - 1);
-    int iy = (int)(fy_ * ht / 200.0f);
-    int h = (iy >= 0) ? iy : iy + ht;
-    h = max(0, min(h, ht - 1));
-    ix = max(0, ix);
-    outp[ow * h + ix][0] = setvalue;
+    int ix = int(fx * outwidth) / 100;
+    int iy = int(fy * height) / 200;
+    int h = (iy >= 0) ? iy : iy + height - 1;
+    outp += outwidth * h;
+    outp[ix][0] = setvalue;
 }
 
 // ---------------------------------------------------------------------------
-void DeFreq::ProcessPlanar(uint8_t *srcp0, int src_height, int src_width, int src_pitch,
+// FAITHFUL PORT of original Fizick DeFreqYV12 — adapted for high bit depth
+void DeFreq::DeFreqProcess(uint8_t *srcp0, int src_height, int src_width, int src_pitch,
     float *fxPeak, float *fyPeak, float *sharpPeak,
     float *fxPeak2, float *fyPeak2, float *sharpPeak2,
     float *fxPeak3, float *fyPeak3, float *sharpPeak3,
     float *fxPeak4, float *fyPeak4, float *sharpPeak4)
 {
-    float *inp = fft_in;
-    fftwf_complex *outp = fft_out;
-    int width_half = src_width / 2;
+    float *inp = in;
+    fftwf_complex *outp = out;
+
+    int w, h;
+    int width_2 = src_width / 2;
+
     uint8_t *srcp = srcp0;
     uint8_t *dstp = srcp0;
 
-    // Image to float
-    for (int h = 0; h < src_height; h++) {
-        for (int w = 0; w < src_width; w++)
+    // pixel to float — faithful to original, just using ReadPixel for bit depth
+    for (h = 0; h < src_height; h++) {
+        for (w = 0; w < src_width; w++)
             inp[w] = ReadPixel(srcp, w);
         srcp += src_pitch;
         inp += nx;
     }
-    inp = fft_in; srcp = srcp0;
+    inp -= nx * src_height;
+    srcp -= src_pitch * src_height;
 
-    // Forward FFT
-    fftwf_execute_dft_r2c(plan_fwd, fft_in, fft_out);
+    fftwf_execute_dft_r2c(plan, inp, out); // do FFT
 
-    // PSD averaging
-    if (show == 2) naverage += 1; else naverage = 1;
+    if (show == 2)
+        naverage += 1;
+    else
+        naverage = 1;
     float faverage = 1.0f / naverage;
-    float *psd_ptr = psd; outp = fft_out;
-    for (int h = 0; h < ny; h++) {
-        for (int w = 0; w < outwidth; w++)
-            psd_ptr[w] = psd_ptr[w] * (1 - faverage) + (outp[w][0] * outp[w][0] + outp[w][1] * outp[w][1]) * faverage;
-        psd_ptr += outwidth; outp += outwidth;
+    // PSD update — using moving pointer exactly like original
+    for (h = 0; h < src_height; h++) {
+        for (w = 0; w < outwidth; w++)
+            psd[w] = psd[w] * (1 - faverage) + (outp[w][0] * outp[w][0] + outp[w][1] * outp[w][1]) * faverage;
+        psd += outwidth;
+        outp += outwidth;
     }
-    outp = fft_out;
+    psd -= outwidth * src_height;
+    outp -= outwidth * src_height;
 
-    // Search peaks
-    if (fx > 0 || fy != 0)   SearchPeak(psd, outwidth, ny, fx, fy, dx, dy, fxPeak, fyPeak, sharpPeak);
-    if (fx2 > 0 || fy2 != 0) SearchPeak(psd, outwidth, ny, fx2, fy2, dx2, dy2, fxPeak2, fyPeak2, sharpPeak2);
-    if (fx3 > 0 || fy3 != 0) SearchPeak(psd, outwidth, ny, fx3, fy3, dx3, dy3, fxPeak3, fyPeak3, sharpPeak3);
-    if (fx4 > 0 || fy4 != 0) SearchPeak(psd, outwidth, ny, fx4, fy4, dx4, dy4, fxPeak4, fyPeak4, sharpPeak4);
+    // search Peaks
+    if (fx > 0 || fy != 0)
+        SearchPeak(psd, outwidth, src_height, fx, fy, dx, dy, fxPeak, fyPeak, sharpPeak);
+    if (fx2 > 0 || fy2 != 0)
+        SearchPeak(psd, outwidth, src_height, fx2, fy2, dx2, dy2, fxPeak2, fyPeak2, sharpPeak2);
+    if (fx3 > 0 || fy3 != 0)
+        SearchPeak(psd, outwidth, src_height, fx3, fy3, dx3, dy3, fxPeak3, fyPeak3, sharpPeak3);
+    if (fx4 > 0 || fy4 != 0)
+        SearchPeak(psd, outwidth, src_height, fx4, fy4, dx4, dy4, fxPeak4, fyPeak4, sharpPeak4);
 
     if (show) {
+        // show mode — EXACT COPY of original Fizick pointer walk, adapted for bit depth
         float fft2min = 0, fft2max = 0;
-        GetFFT2minmax(psd, outwidth, ny, &fft2min, &fft2max);
-        if (fx > 0 || fy != 0)   DrawSearchBox(psd, outwidth, ny, fx, fy, dx, dy, fft2max);
-        if (fx2 > 0 || fy2 != 0) DrawSearchBox(psd, outwidth, ny, fx2, fy2, dx2, dy2, fft2max);
-        if (fx3 > 0 || fy3 != 0) DrawSearchBox(psd, outwidth, ny, fx3, fy3, dx3, dy3, fft2max);
-        if (fx4 > 0 || fy4 != 0) DrawSearchBox(psd, outwidth, ny, fx4, fy4, dx4, dy4, fft2max);
+        GetFFT2minmax(psd, outwidth, src_height, &fft2min, &fft2max);
 
-        float logmin = logf(fft2min), logmax = logf(fft2max);
-        float fac = (float)max_pixel_value + 0.5f;
-        if (logmax > logmin) fac /= (logmax - logmin);
+        if (fx > 0 || fy != 0)   DrawSearchBox(psd, outwidth, src_height, fx, fy, dx, dy, fft2max);
+        if (fx2 > 0 || fy2 != 0) DrawSearchBox(psd, outwidth, src_height, fx2, fy2, dx2, dy2, fft2max);
+        if (fx3 > 0 || fy3 != 0) DrawSearchBox(psd, outwidth, src_height, fx3, fy3, dx3, dy3, fft2max);
+        if (fx4 > 0 || fy4 != 0) DrawSearchBox(psd, outwidth, src_height, fx4, fy4, dx4, dy4, fft2max);
 
-        // Show spectrum: revert and stack, matching original Fizick layout
-        // Top half of display = positive frequencies (rows 0..ht/2-1 of PSD, displayed bottom-to-top)
-        // Bottom half of display = negative frequencies (rows ht/2..ht-1 of PSD, displayed bottom-to-top)
-        dstp = srcp0;
-        psd_ptr = psd + (src_height / 2) * outwidth; // start at middle of PSD
-        for (int h = 0; h < src_height / 2; h++) {
-            psd_ptr -= outwidth;
-            int wlimit = min(width_half, outwidth);
-            for (int w = 0; w < wlimit; w++)
-                WritePixelInt(dstp, w, (int)(fac * (logf(psd_ptr[w] + 1e-15f) - logmin)));
+        float logmin = logf(fft2min);
+        float logmax = logf(fft2max);
+        float fac = ((float)max_pixel_value + 0.5f) / (logmax - logmin);
+
+        // show fft log PSD on left half — EXACT pointer walk from original
+        psd += (src_height / 2) * outwidth; // middle positive
+        for (h = 0; h < src_height / 2; h++) {
+            psd -= outwidth;
+            for (w = 0; w < width_2; w++) {
+                int dstcur = (int)(fac * (logf(psd[w] + 1e-15f) - logmin));
+                WritePixelClamped(dstp, w, dstcur);
+            }
             dstp += src_pitch;
         }
-        psd_ptr = psd + src_height * outwidth; // start at bottom of PSD
-        for (int h = src_height / 2; h < src_height; h++) {
-            psd_ptr -= outwidth;
-            int wlimit = min(width_half, outwidth);
-            for (int w = 0; w < wlimit; w++)
-                WritePixelInt(dstp, w, (int)(fac * (logf(psd_ptr[w] + 1e-15f) - logmin)));
+        psd += (src_height) * outwidth; // bottom negative
+        for (h = src_height / 2; h < src_height; h++) {
+            psd -= outwidth;
+            for (w = 0; w < width_2; w++) {
+                int dstcur = (int)(fac * (logf(psd[w] + 1e-15f) - logmin));
+                WritePixelClamped(dstp, w, dstcur);
+            }
             dstp += src_pitch;
         }
+        dstp -= src_pitch * src_height;
+        psd -= outwidth * (src_height - (src_height / 2));
 
-        // Test frequency stripes on right top quarter
-        outp = fft_out;
-        for (int h = 0; h < ny; h++) {
-            for (int w = 0; w < outwidth; w++) { outp[w][0] = 0; outp[w][1] = 0; }
+        // test frequency stripes — exact copy of original
+        for (h = 0; h < src_height; h++) {
+            for (w = 0; w < outwidth; w++) {
+                outp[w][0] = 0; outp[w][1] = 0;
+            }
             outp += outwidth;
         }
-        outp = fft_out;
-        fft_out[0][0] = neutral_value;
+        outp -= outwidth * src_height;
+
+        outp[0][0] = neutral_value; // DC = neutral grey
 
         float weight = 0;
         if (fx > 0 || fy != 0)   weight += 1.0f;
@@ -536,37 +596,65 @@ void DeFreq::ProcessPlanar(uint8_t *srcp0, int src_height, int src_width, int sr
         float setvalue = 60.0f / (weight + 0.0001f);
         if (bits_per_sample > 8) setvalue *= (float)(1 << (bits_per_sample - 8));
 
-        if (fx > 0 || fy != 0)   FrequencySwitchOn(outp, outwidth, ny, fx, fy, setvalue);
-        if (fx2 > 0 || fy2 != 0) FrequencySwitchOn(outp, outwidth, ny, fx2, fy2, setvalue / 1.4f);
-        if (fx3 > 0 || fy3 != 0) FrequencySwitchOn(outp, outwidth, ny, fx3, fy3, setvalue / 2.0f);
-        if (fx4 > 0 || fy4 != 0) FrequencySwitchOn(outp, outwidth, ny, fx4, fy4, setvalue / 2.8f);
+        if (fx > 0 || fy != 0)   FrequencySwitchOn(outp, outwidth, src_height, fx, fy, setvalue);
+        if (fx2 > 0 || fy2 != 0) FrequencySwitchOn(outp, outwidth, src_height, fx2, fy2, setvalue / 1.4f);
+        if (fx3 > 0 || fy3 != 0) FrequencySwitchOn(outp, outwidth, src_height, fx3, fy3, setvalue / 2.0f);
+        if (fx4 > 0 || fy4 != 0) FrequencySwitchOn(outp, outwidth, src_height, fx4, fy4, setvalue / 2.8f);
 
-        fftwf_execute_dft_c2r(plan_inv, fft_out, fft_in);
+        fftwf_execute_dft_c2r(plani, outp, in); // iFFT
 
-        inp = fft_in; dstp = srcp0;
-        for (int h = 0; h < src_height / 2; h++) {
-            for (int w = width_half; w < src_width; w++)
-                WritePixelInt(dstp, w, (int)(inp[w]));
-            dstp += src_pitch; inp += nx;
+        // show stripes on right top quarter — exact copy of original
+        inp = in;
+        dstp = srcp0;
+        for (h = 0; h < src_height / 2; h++) {
+            for (w = width_2; w < src_width; w++) {
+                int result = (int)(inp[w]);
+                WritePixelClamped(dstp, w, result);
+            }
+            dstp += src_pitch;
+            inp += nx;
         }
+        dstp -= src_pitch * (src_height / 2);
+        inp -= nx * (src_height / 2);
 
     } else {
-        // Work mode
+        // work mode — exact copy of original
         bool clean = false;
-        if (*sharpPeak > sharp)   { CleanWindow(fft_out, outwidth, ny, fx, fy, dx, dy, *fxPeak, *fyPeak, *sharpPeak); clean = true; }
-        if (*sharpPeak2 > sharp2) { CleanWindow(fft_out, outwidth, ny, fx2, fy2, dx2, dy2, *fxPeak2, *fyPeak2, *sharpPeak2); clean = true; }
-        if (*sharpPeak3 > sharp3) { CleanWindow(fft_out, outwidth, ny, fx3, fy3, dx3, dy3, *fxPeak3, *fyPeak3, *sharpPeak3); clean = true; }
-        if (*sharpPeak4 > sharp4) { CleanWindow(fft_out, outwidth, ny, fx4, fy4, dx4, dy4, *fxPeak4, *fyPeak4, *sharpPeak4); clean = true; }
-        if (cutx > 0 && cuty > 0) { CleanHigh(fft_out, outwidth, ny, cutx, cuty); clean = true; }
+
+        if (*sharpPeak > sharp) {
+            CleanWindow(out, outwidth, src_height, fx, fy, dx, dy, *fxPeak, *fyPeak, *sharpPeak);
+            clean = true;
+        }
+        if (*sharpPeak2 > sharp2) {
+            CleanWindow(out, outwidth, src_height, fx2, fy2, dx2, dy2, *fxPeak2, *fyPeak2, *sharpPeak2);
+            clean = true;
+        }
+        if (*sharpPeak3 > sharp3) {
+            CleanWindow(out, outwidth, src_height, fx3, fy3, dx3, dy3, *fxPeak3, *fyPeak3, *sharpPeak3);
+            clean = true;
+        }
+        if (*sharpPeak4 > sharp4) {
+            CleanWindow(out, outwidth, src_height, fx4, fy4, dx4, dy4, *fxPeak4, *fyPeak4, *sharpPeak4);
+            clean = true;
+        }
+
+        if (cutx > 0 && cuty > 0) {
+            CleanHigh(out, outwidth, src_height, cutx, cuty);
+            clean = true;
+        }
 
         if (clean) {
-            fftwf_execute_dft_c2r(plan_inv, fft_out, fft_in);
-            float norm = 1.0f / ((float)nx * ny);
-            inp = fft_in; dstp = srcp0;
-            for (int h = 0; h < src_height; h++) {
-                for (int w = 0; w < src_width; w++)
-                    WritePixelInt(dstp, w, (int)(inp[w] * norm + 0.5f));
-                dstp += src_pitch; inp += nx;
+            fftwf_execute_dft_c2r(plani, out, in); // iFFT
+
+            float norm = 1.0f / (nx * ny);
+            inp = in;
+            for (h = 0; h < src_height; h++) {
+                for (w = 0; w < src_width; w++) {
+                    int result = (int)(inp[w] * norm);
+                    WritePixelClamped(dstp, w, result);
+                }
+                dstp += src_pitch;
+                inp += nx;
             }
         }
     }
@@ -591,11 +679,12 @@ PVideoFrame __stdcall DeFreq::GetFrame(int n, IScriptEnvironment *env)
     }
 
     if (show) {
-        int planes_to_clear[2]; int clear_count = 0;
-        if (plane != 0) planes_to_clear[clear_count++] = PLANAR_Y;
-        if (plane != 1) planes_to_clear[clear_count++] = PLANAR_U;
-        if (plane != 2 && clear_count < 2) planes_to_clear[clear_count++] = PLANAR_V;
-        for (int i = 0; i < clear_count; i++) {
+        // Set non-working planes to neutral
+        int planes_to_clear[2]; int cc = 0;
+        if (plane != 0) planes_to_clear[cc++] = PLANAR_Y;
+        if (plane != 1) planes_to_clear[cc++] = PLANAR_U;
+        if (plane != 2 && cc < 2) planes_to_clear[cc++] = PLANAR_V;
+        for (int i = 0; i < cc; i++) {
             uint8_t *p = src->GetWritePtr(planes_to_clear[i]);
             int pitch = src->GetPitch(planes_to_clear[i]);
             int rowsize = src->GetRowSize(planes_to_clear[i]);
@@ -610,7 +699,7 @@ PVideoFrame __stdcall DeFreq::GetFrame(int n, IScriptEnvironment *env)
     int src_height = src->GetHeight(avs_plane);
     int src_width_pixels = src_width_bytes / PixelBytes();
 
-    ProcessPlanar(srcp, src_height, src_width_pixels, src_pitch,
+    DeFreqProcess(srcp, src_height, src_width_pixels, src_pitch,
         &fxPeak, &fyPeak, &sharpPeak, &fxPeak2, &fyPeak2, &sharpPeak2,
         &fxPeak3, &fyPeak3, &sharpPeak3, &fxPeak4, &fyPeak4, &sharpPeak4);
 
