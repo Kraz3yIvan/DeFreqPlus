@@ -550,7 +550,58 @@ void DeFreq::DeFreqProcess(uint8_t *srcp0, int src_height, int src_width, int sr
     if (fx4 > 0 || fy4 != 0)
         SearchPeak(psd, outwidth, src_height, fx4, fy4, dx4, dy4, fxPeak4, fyPeak4, sharpPeak4);
 
-    if (show) {
+    if (show == 3) {
+        // ---------------------------------------------------------------
+        // DIAGNOSTIC MODE: pure FFT round-trip, NO cleaning.
+        // Tests whether forward FFT -> inverse FFT -> write-back
+        // produces a pixel-accurate reconstruction at the current bit depth.
+        // If this looks correct, the basic pipeline works and the bug is
+        // specifically in CleanWindow. If it looks wrong, the issue is in
+        // the FFT round-trip or read/write code.
+        // ---------------------------------------------------------------
+        fftwf_execute_dft_c2r(plani, out, in); // inverse of the forward we already did
+
+        float norm = output_scale / (float)(nx * ny);
+        inp = in;
+        int maxerr = 0;
+        srcp = srcp0;
+        for (h = 0; h < src_height; h++) {
+            for (w = 0; w < src_width; w++) {
+                int result = (int)(inp[w] * norm + 0.5f);
+                int original = (int)ReadPixel(srcp, w);
+                int err = (result > original) ? result - original : original - result;
+                if (err > maxerr) maxerr = err;
+                WritePixelClamped(dstp, w, result);
+            }
+            dstp += src_pitch;
+            srcp += src_pitch;
+            inp += nx;
+        }
+
+        // Write diagnostic log
+        FILE *flog = fopen("C:\\defreq_debug.log", "w");
+        if (flog) {
+            fprintf(flog, "DeFreq+ Diagnostic (show=3, pure round-trip)\n");
+            fprintf(flog, "bits_per_sample  = %d\n", bits_per_sample);
+            fprintf(flog, "max_pixel_value  = %d\n", max_pixel_value);
+            fprintf(flog, "input_scale      = %.10f\n", input_scale);
+            fprintf(flog, "output_scale     = %.6f\n", output_scale);
+            fprintf(flog, "nx (FFT cols)    = %d\n", nx);
+            fprintf(flog, "ny (FFT rows)    = %d\n", ny);
+            fprintf(flog, "outwidth         = %d\n", outwidth);
+            fprintf(flog, "src_width (px)   = %d\n", src_width);
+            fprintf(flog, "src_height       = %d\n", src_height);
+            fprintf(flog, "src_pitch (bytes) = %d\n", src_pitch);
+            fprintf(flog, "nx == src_width? %s\n", (nx == src_width) ? "YES" : "*** NO - MISMATCH ***");
+            fprintf(flog, "ny == src_height? %s\n", (ny == src_height) ? "YES" : "*** NO - MISMATCH ***");
+            fprintf(flog, "max round-trip pixel error = %d\n", maxerr);
+            fprintf(flog, "peak1: fx=%.2f fy=%.2f sharp=%.2f (threshold=%.2f) %s\n",
+                    *fxPeak, *fyPeak, *sharpPeak, sharp,
+                    (*sharpPeak > sharp) ? "WOULD CLEAN" : "below threshold");
+            fclose(flog);
+        }
+
+    } else if (show == 1 || show == 2) {
         // show mode — EXACT COPY of original Fizick pointer walk, adapted for bit depth
         float fft2min = 0, fft2max = 0;
         GetFFT2minmax(psd, outwidth, src_height, &fft2min, &fft2max);
@@ -627,7 +678,7 @@ void DeFreq::DeFreqProcess(uint8_t *srcp0, int src_height, int src_width, int sr
         inp -= nx * (src_height / 2);
 
     } else {
-        // work mode — exact copy of original
+        // work mode (show=0)
         bool clean = false;
 
         if (*sharpPeak > sharp) {
@@ -655,7 +706,7 @@ void DeFreq::DeFreqProcess(uint8_t *srcp0, int src_height, int src_width, int sr
         if (clean) {
             fftwf_execute_dft_c2r(plani, out, in); // iFFT
 
-            float norm = output_scale / (nx * ny);  // combined iFFT normalisation + bit-depth restore
+            float norm = output_scale / (float)(nx * ny);  // combined iFFT normalisation + bit-depth restore
             inp = in;
             for (h = 0; h < src_height; h++) {
                 for (w = 0; w < src_width; w++) {
@@ -687,8 +738,8 @@ PVideoFrame __stdcall DeFreq::GetFrame(int n, IScriptEnvironment *env)
         default: avs_plane = PLANAR_V; break;
     }
 
-    if (show) {
-        // Set non-working planes to neutral
+    if (show == 1 || show == 2) {
+        // Set non-working planes to neutral (skip for show=3 diagnostic)
         int planes_to_clear[2]; int cc = 0;
         if (plane != 0) planes_to_clear[cc++] = PLANAR_Y;
         if (plane != 1) planes_to_clear[cc++] = PLANAR_U;
