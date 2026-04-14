@@ -601,6 +601,144 @@ void DeFreq::DeFreqProcess(uint8_t *srcp0, int src_height, int src_width, int sr
             fclose(flog);
         }
 
+    } else if (show == 4) {
+        // ---------------------------------------------------------------
+        // DIAGNOSTIC: simple uniform scale of the SAME bins CleanWindow
+        // would target.  Multiplies by 0.5 — no conditional logic, no
+        // sqrt, no adaptive thresholding.  If this produces correct
+        // output, the pipeline is fine and the bug is inside CleanWindow's
+        // specific computation.  If it corrupts, something about modifying
+        // those bins is inherently broken at this bit depth.
+        // ---------------------------------------------------------------
+        float fxmin = max(0.0f, fx - dx);
+        float fxmax = min(100.0f, fx + dx);
+        float fymin = max(-100.0f, fy - dy);
+        float fymax = min(100.0f, fy + dy);
+        int ixmin = int(fxmin * outwidth) / 100;
+        int ixmax = int(fxmax * outwidth) / 100;
+        int iymin = int(fymin * src_height) / 200;
+        int iymax = int(fymax * src_height) / 200;
+
+        int bins_modified = 0;
+        outp = out;
+        for (h = 0; h < src_height / 2; h++) {
+            if (h >= iymin && h <= iymax) {
+                for (w = ixmin; w <= ixmax; w++) {
+                    outp[w][0] *= 0.5f;
+                    outp[w][1] *= 0.5f;
+                    bins_modified++;
+                }
+            }
+            outp += outwidth;
+        }
+        for (h = src_height / 2; h < src_height; h++) {
+            if (h >= src_height + iymin - 1 && h <= src_height + iymax - 1) {
+                for (w = ixmin; w <= ixmax; w++) {
+                    outp[w][0] *= 0.5f;
+                    outp[w][1] *= 0.5f;
+                    bins_modified++;
+                }
+            }
+            outp += outwidth;
+        }
+
+        fftwf_execute_dft_c2r(plani, out, in);
+
+        float norm = output_scale / (float)(nx * ny);
+        inp = in;
+        float minval = 1e30f, maxval = -1e30f;
+        for (h = 0; h < src_height; h++) {
+            for (w = 0; w < src_width; w++) {
+                float v = inp[w] * norm;
+                if (v < minval) minval = v;
+                if (v > maxval) maxval = v;
+                int result = (int)(v + 0.5f);
+                WritePixelClamped(dstp, w, result);
+            }
+            dstp += src_pitch;
+            inp += nx;
+        }
+
+        FILE *flog = fopen("A:\\ds9\\defreq_debug.log", "w");
+        if (flog) {
+            fprintf(flog, "DeFreq+ Diagnostic (show=4, uniform 0.5x scale)\n");
+            fprintf(flog, "bins_modified    = %d\n", bins_modified);
+            fprintf(flog, "search box: kx=[%d..%d] ky_neg=[%d..%d]\n", ixmin, ixmax,
+                    src_height + iymin - 1, src_height + iymax - 1);
+            fprintf(flog, "pixel range after iFFT: min=%.2f max=%.2f\n", minval, maxval);
+            fprintf(flog, "expected range: 0 to %d\n", max_pixel_value);
+            fclose(flog);
+        }
+
+    } else if (show == 5) {
+        // ---------------------------------------------------------------
+        // DIAGNOSTIC: actual CleanWindow + iFFT, with detailed logging.
+        // Identical to work mode but logs what CleanWindow does.
+        // ---------------------------------------------------------------
+        // Snapshot a few out[] values BEFORE cleaning
+        int w_Peak = int(*fxPeak * outwidth) / 100;
+        int h_Peak = (*fyPeak > 0) ? int(*fyPeak * src_height) / 200
+                                   : int(*fyPeak * src_height) / 200 + src_height - 1;
+        float pre_peak_re = out[h_Peak * outwidth + w_Peak][0];
+        float pre_peak_im = out[h_Peak * outwidth + w_Peak][1];
+
+        // Run actual CleanWindow
+        CleanWindow(out, outwidth, src_height, fx, fy, dx, dy, *fxPeak, *fyPeak, *sharpPeak);
+
+        float post_peak_re = out[h_Peak * outwidth + w_Peak][0];
+        float post_peak_im = out[h_Peak * outwidth + w_Peak][1];
+
+        // Check for NaN/Inf in modified region
+        float fxmin = max(0.0f, fx - dx);
+        float fxmax = min(100.0f, fx + dx);
+        int ixmin = int(fxmin * outwidth) / 100;
+        int ixmax = int(fxmax * outwidth) / 100;
+        int nan_count = 0, inf_count = 0;
+        float out_min = 1e30f, out_max = -1e30f;
+        for (h = 0; h < src_height; h++) {
+            for (w = ixmin; w <= ixmax; w++) {
+                float re = out[h * outwidth + w][0];
+                float im = out[h * outwidth + w][1];
+                if (re != re || im != im) nan_count++;       // NaN check
+                if (re > 1e30f || re < -1e30f || im > 1e30f || im < -1e30f) inf_count++;
+                if (re < out_min) out_min = re;
+                if (re > out_max) out_max = re;
+                if (im < out_min) out_min = im;
+                if (im > out_max) out_max = im;
+            }
+        }
+
+        fftwf_execute_dft_c2r(plani, out, in);
+
+        float norm = output_scale / (float)(nx * ny);
+        inp = in;
+        float pix_min = 1e30f, pix_max = -1e30f;
+        int pix_nan = 0;
+        for (h = 0; h < src_height; h++) {
+            for (w = 0; w < src_width; w++) {
+                float v = inp[w] * norm;
+                if (v != v) pix_nan++;
+                if (v < pix_min) pix_min = v;
+                if (v > pix_max) pix_max = v;
+                int result = (int)(v + 0.5f);
+                WritePixelClamped(dstp, w, result);
+            }
+            dstp += src_pitch;
+            inp += nx;
+        }
+
+        FILE *flog = fopen("A:\\ds9\\defreq_debug.log", "w");
+        if (flog) {
+            fprintf(flog, "DeFreq+ Diagnostic (show=5, CleanWindow + iFFT)\n");
+            fprintf(flog, "peak bin [%d][%d]: BEFORE (%.4f, %.4f) AFTER (%.4f, %.4f)\n",
+                    h_Peak, w_Peak, pre_peak_re, pre_peak_im, post_peak_re, post_peak_im);
+            fprintf(flog, "modified region coefficients: min=%.4f max=%.4f\n", out_min, out_max);
+            fprintf(flog, "NaN in coefficients: %d, near-Inf: %d\n", nan_count, inf_count);
+            fprintf(flog, "pixel values after iFFT+norm: min=%.2f max=%.2f NaN=%d\n", pix_min, pix_max, pix_nan);
+            fprintf(flog, "expected pixel range: 0 to %d\n", max_pixel_value);
+            fclose(flog);
+        }
+
     } else if (show == 1 || show == 2) {
         // show mode — EXACT COPY of original Fizick pointer walk, adapted for bit depth
         float fft2min = 0, fft2max = 0;
@@ -739,7 +877,7 @@ PVideoFrame __stdcall DeFreq::GetFrame(int n, IScriptEnvironment *env)
     }
 
     if (show == 1 || show == 2) {
-        // Set non-working planes to neutral (skip for show=3 diagnostic)
+        // Set non-working planes to neutral (skip for show=3,4,5 diagnostics)
         int planes_to_clear[2]; int cc = 0;
         if (plane != 0) planes_to_clear[cc++] = PLANAR_Y;
         if (plane != 1) planes_to_clear[cc++] = PLANAR_U;
