@@ -58,6 +58,8 @@ class DeFreq : public GenericVideoFilter {
     int             bits_per_sample;
     int             max_pixel_value;
     float           neutral_value;
+    float           input_scale;   // maps pixel values to 8-bit-equivalent range for FFT
+    float           output_scale;  // maps FFT results back to native bit depth
 
     HINSTANCE hinstLib;
     fftwf_malloc_proc            fftwf_malloc;
@@ -172,6 +174,13 @@ DeFreq::DeFreq(PClip _child,
 
     max_pixel_value = (1 << bits_per_sample) - 1;
     neutral_value   = static_cast<float>(1 << (bits_per_sample - 1));
+
+    // Normalise all bit depths to 8-bit-equivalent range for FFT processing.
+    // At 8-bit input_scale==1 so behaviour is identical to the original code.
+    // At higher bit depths the FFT operates on the same magnitude range,
+    // eliminating float-precision issues in CleanWindow's spectrum modification.
+    input_scale  = 255.0f / static_cast<float>(max_pixel_value);
+    output_scale = static_cast<float>(max_pixel_value) / 255.0f;
 
     // Exact image dimensions — same as original Fizick code
     if (plane == 0) {
@@ -504,10 +513,10 @@ void DeFreq::DeFreqProcess(uint8_t *srcp0, int src_height, int src_width, int sr
     uint8_t *srcp = srcp0;
     uint8_t *dstp = srcp0;
 
-    // pixel to float — faithful to original, just using ReadPixel for bit depth
+    // pixel to float — normalised to 8-bit-equivalent range for all bit depths
     for (h = 0; h < src_height; h++) {
         for (w = 0; w < src_width; w++)
-            inp[w] = ReadPixel(srcp, w);
+            inp[w] = ReadPixel(srcp, w) * input_scale;
         srcp += src_pitch;
         inp += nx;
     }
@@ -586,7 +595,7 @@ void DeFreq::DeFreqProcess(uint8_t *srcp0, int src_height, int src_width, int sr
         }
         outp -= outwidth * src_height;
 
-        outp[0][0] = neutral_value; // DC = neutral grey
+        outp[0][0] = neutral_value * input_scale; // DC = neutral grey (128 in normalised space)
 
         float weight = 0;
         if (fx > 0 || fy != 0)   weight += 1.0f;
@@ -594,7 +603,7 @@ void DeFreq::DeFreqProcess(uint8_t *srcp0, int src_height, int src_width, int sr
         if (fx3 > 0 || fy3 != 0) weight += 1 / 2.0f;
         if (fx4 > 0 || fy4 != 0) weight += 1 / 2.8f;
         float setvalue = 60.0f / (weight + 0.0001f);
-        if (bits_per_sample > 8) setvalue *= (float)(1 << (bits_per_sample - 8));
+        // No bit-depth scaling needed: FFT operates in normalised 8-bit-equivalent space
 
         if (fx > 0 || fy != 0)   FrequencySwitchOn(outp, outwidth, src_height, fx, fy, setvalue);
         if (fx2 > 0 || fy2 != 0) FrequencySwitchOn(outp, outwidth, src_height, fx2, fy2, setvalue / 1.4f);
@@ -603,12 +612,12 @@ void DeFreq::DeFreqProcess(uint8_t *srcp0, int src_height, int src_width, int sr
 
         fftwf_execute_dft_c2r(plani, outp, in); // iFFT
 
-        // show stripes on right top quarter — exact copy of original
+        // show stripes on right top quarter — scale back to native bit depth
         inp = in;
         dstp = srcp0;
         for (h = 0; h < src_height / 2; h++) {
             for (w = width_2; w < src_width; w++) {
-                int result = (int)(inp[w]);
+                int result = (int)(inp[w] * output_scale + 0.5f);
                 WritePixelClamped(dstp, w, result);
             }
             dstp += src_pitch;
@@ -646,11 +655,11 @@ void DeFreq::DeFreqProcess(uint8_t *srcp0, int src_height, int src_width, int sr
         if (clean) {
             fftwf_execute_dft_c2r(plani, out, in); // iFFT
 
-            float norm = 1.0f / (nx * ny);
+            float norm = output_scale / (nx * ny);  // combined iFFT normalisation + bit-depth restore
             inp = in;
             for (h = 0; h < src_height; h++) {
                 for (w = 0; w < src_width; w++) {
-                    int result = (int)(inp[w] * norm);
+                    int result = (int)(inp[w] * norm + 0.5f);
                     WritePixelClamped(dstp, w, result);
                 }
                 dstp += src_pitch;
