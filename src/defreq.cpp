@@ -579,7 +579,7 @@ void DeFreq::DeFreqProcess(uint8_t *srcp0, int src_height, int src_width, int sr
         }
 
         // Write diagnostic log
-        FILE *flog = fopen("C:\\defreq_debug.log", "w");
+        FILE *flog = fopen("A:\\ds9\\defreq_debug.log", "w");
         if (flog) {
             fprintf(flog, "DeFreq+ Diagnostic (show=3, pure round-trip)\n");
             fprintf(flog, "bits_per_sample  = %d\n", bits_per_sample);
